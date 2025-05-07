@@ -24,7 +24,7 @@ export function ClientPaymentSection() {
   const { data: currentBalance } = api.userCredit.getCurrentBalance.useQuery(
     undefined, 
     { 
-      refetchInterval: 3000, // Refetch every 3 seconds
+      refetchInterval: 60000, // Refetch every 60 seconds
       refetchOnWindowFocus: true
     }
   );

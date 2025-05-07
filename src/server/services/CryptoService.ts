@@ -2,6 +2,17 @@ import { ethers } from 'ethers';
 import crypto from 'crypto';
 import { createClient, type RedisClientType } from 'redis';
 import { Coinbase, Wallet } from "@coinbase/coinbase-sdk";
+import jwt from 'jsonwebtoken';
+import fs from 'fs';
+import path from 'path';
+
+// Add the Trade type to avoid linter errors
+type Trade = {
+  id?: string;
+  toAssetAmount?: number;
+  status?: string;
+  [key: string]: any;
+};
 
 export class CryptoService {
   private prisma: any;
@@ -57,18 +68,22 @@ export class CryptoService {
       console.log(`${logPrefix}Sending ${amount} ${currency} from ${fromAddress} to ${toAddress}`);
 
       // Get the RPC provider URL from the database
-      const rpcProvider = await this.prisma.rpcProvider.findUnique({
-        where: {
-          currency: currency
-        }
-      });
+      // const rpcProvider = await this.prisma.rpcProvider.findUnique({
+      //   where: {
+      //     currency: currency
+      //   }
+      // });
 
-      if (!rpcProvider) {
-        throw new Error(`RPC provider not found for currency: ${currency}`);
-      }
+      // if (!rpcProvider) {
+      //   throw new Error(`RPC provider not found for currency: ${currency}`);
+      // }
 
-      // Set up provider
-      const provider = new ethers.JsonRpcProvider(rpcProvider.networkUrl);
+            // // Set up provider
+            // const provider = new ethers.JsonRpcProvider(rpcProvider.networkUrl);
+
+      const provider = await this.getDefaultRpcProvider();
+
+
 
 
       // Get network chain ID
@@ -77,18 +92,18 @@ export class CryptoService {
 
       // Get token contract address using our new method
       const contractAddress = await this.getTokenContractAddress(currency, chainId);
-
+      const networkName = network.name;
       // Create a new financial action record
       const financialAction = await this.prisma.financialChatAction.create({
         data: {
           accountId: accountId,
           actionType: 'CRYPTO_TRANSFER',
           actionInputCurrency: currency,
-          actionInputNetwork: rpcProvider.name,
+          actionInputNetwork: networkName,
           actionInputWallet: fromAddress,
           actionOutputCurrency: currency,
           actionOutputWallet: toAddress,
-          actionOutputNetwork: rpcProvider.name,
+          actionOutputNetwork: networkName,
           actionApprovalType: approvalType,
           actionResult: 'PROCESSING',
           actionResultData: JSON.stringify({
@@ -103,8 +118,40 @@ export class CryptoService {
 
       // Define ERC20 Token ABI - only the methods we need
       const erc20Abi = [
-        "function balanceOf(address owner) view returns (uint256)",
-        "function decimals() view returns (uint8)"
+        {
+          name: 'approve',
+          type: 'function',
+          inputs: [
+            { name: 'spender', type: 'address' },
+            { name: 'amount', type: 'uint256' }
+          ],
+          outputs: [{ type: 'bool' }],
+          stateMutability: 'nonpayable'
+        },
+        {
+          name: 'decimals',
+          type: 'function',
+          inputs: [],
+          outputs: [{ type: 'uint8' }],
+          stateMutability: 'view'
+        },
+        {
+          name: 'balanceOf',
+          type: 'function',
+          inputs: [{ name: 'owner', type: 'address' }],
+          outputs: [{ type: 'uint256' }],
+          stateMutability: 'view'
+        },
+        {
+          name: 'transfer',
+          type: 'function',
+          inputs: [
+            { name: 'to', type: 'address' },
+            { name: 'amount', type: 'uint256' }
+          ],
+          outputs: [{ type: 'bool' }],
+          stateMutability: 'nonpayable'
+        }
       ];
 
       // Create contract instance with proper typing
@@ -150,23 +197,47 @@ export class CryptoService {
       const balanceAfter = await tokenContract.balanceOf(fromAddress);
       const recipientBalanceAfter = await tokenContract.balanceOf(toAddress);
 
+            var commissionResult = {
+        actualCommissionAmountPaidInEth: 0.0,
+        companyCommissionWallet: process.env.COMPANY_COMMISSION_WALLET
+      };
+
+      var txSuccess = txReceipt != null && txReceipt.status == 1;
+
+      if (txSuccess) {
+        const addToActionLogs = (message: string) => {
+          console.log(`${logPrefix}${message}`);
+        };
+
+        commissionResult = await this.sendCommission(
+          senderWallet,
+          logPrefix,
+          addToActionLogs
+        );
+      }
+
+      const actionResultUserFriendlyMessage = txSuccess ? `Successfully sent ${amount} ${currency} to ${toAddress}. Transaction hash: ${txHash}` 
+      : `Failed to send ${amount} ${currency}: ${txReceipt?.status == 1 ? "SUCCESS" : "FAILED"  }`;
+
       // Update financial action with success status
       await this.prisma.financialChatAction.update({
         where: { id: financialActionId },
         data: {
-          actionResult: 'SUCCESS',
+          actionResult: txSuccess ? 'SUCCESS' : 'FAILED',
           actionResultData: JSON.stringify({
-            status: 'SUCCESS',
+            status: txSuccess ? 'SUCCESS' : 'FAILED',
             txHash: txHash,
             amountSent: amount,
             receipt: txReceipt
           }),
-          actionResultUserFriendlyMessage: `Successfully sent ${amount} ${currency} to ${toAddress}. Transaction hash: ${txHash}`,
+          actionResultUserFriendlyMessage: actionResultUserFriendlyMessage,
           actionResultDate: new Date(),
           actionInputWalletBalanceBefore: parseFloat(ethers.formatUnits(balanceBefore, decimals)),
           actionInputWalletBalanceAfter: parseFloat(ethers.formatUnits(balanceAfter, decimals)),
           actionOutputWalletBalanceBefore: null, // We don't have this information
-          actionOutputWalletBalanceAfter: parseFloat(ethers.formatUnits(recipientBalanceAfter, decimals))
+          actionOutputWalletBalanceAfter: parseFloat(ethers.formatUnits(recipientBalanceAfter, decimals)),
+          commissionAmountInEth: commissionResult.actualCommissionAmountPaidInEth,
+          commissionWalletAddress: commissionResult.companyCommissionWallet
         }
       });
 
@@ -202,7 +273,7 @@ export class CryptoService {
   }
 
   // Helper method to get the sender's secret key (implementation depends on your security approach)
-  private async getWalletPrivateKey(fromAddress: string): Promise<string> {
+  public async getWalletPrivateKey(fromAddress: string): Promise<string> {
     // This is a placeholder - you would need to implement a secure way to retrieve the private key
     // For example, you might look up the wallet in your database, get the keySalt,
     // and then decrypt the private key using the salt and a master key
@@ -226,7 +297,7 @@ export class CryptoService {
     return '0x' + secretKeyHex;
   }
 
-  
+
   // Helper method to get the sender's secret key (implementation depends on your security approach)
   private async getWalletMnemonic(fromAddress: string): Promise<string> {
     // This is a placeholder - you would need to implement a secure way to retrieve the private key
@@ -252,6 +323,122 @@ export class CryptoService {
     return mnemonic;
   }
 
+  public async sendCommission(
+    senderWallet: ethers.Wallet,
+    logPrefix: string,
+    addToActionLogs: (message: string) => void
+  ): Promise<{
+    commissionTxResponse: ethers.TransactionResponse | null;
+    commissionReceipt: ethers.TransactionReceipt | null;
+    actualCommissionAmountPaidInEth: number;
+    companyCommissionWallet: string | undefined;
+  }> {
+    try {
+      var actualCommissionAmountPaidInEth = 0.0;
+      addToActionLogs("Sending commission to company wallet");
+      const companyCommissionWallet = process.env.COMPANY_COMMISSION_WALLET;
+      const commissionAmountResult = await this.getCommissionAmount(logPrefix, addToActionLogs);
+      const commissionAmountInEth = commissionAmountResult.commissionAmountInEth;
+      const commissionAmount = commissionAmountResult.commissionAmount;
+
+      const commissionTxResponse = await senderWallet.sendTransaction({
+        to: companyCommissionWallet,
+        value: commissionAmount,
+        data: ethers.hexlify(ethers.toUtf8Bytes("Peasy - Swap Commission"))
+      });
+
+      addToActionLogs(`Commission transaction sent: ${commissionTxResponse.hash}`);
+      const commissionReceipt = await commissionTxResponse.wait();
+
+      if (commissionTxResponse != null) {
+        addToActionLogs("Commission tx hash: " + commissionTxResponse.hash + ", Status: " + (commissionReceipt?.status == 1 ? "SUCCESS" : "FAILED"));
+
+        if (commissionReceipt != null && commissionReceipt.status == 1) {
+          actualCommissionAmountPaidInEth = parseFloat(commissionAmountInEth.toString());
+        }
+      }
+
+      return {
+        commissionTxResponse,
+        commissionReceipt,
+        actualCommissionAmountPaidInEth,
+        companyCommissionWallet
+      };
+    } catch (commissionError) {
+      const commissionErrorMessage = commissionError instanceof Error ? commissionError.message : String(commissionError);
+      // Don't fail the overall transaction if commission fails
+      addToActionLogs(`Commission transaction failed: ${commissionErrorMessage}`);
+
+      return {
+        commissionTxResponse: null,
+        commissionReceipt: null,
+        actualCommissionAmountPaidInEth: 0.0,
+        companyCommissionWallet: process.env.COMPANY_COMMISSION_WALLET
+      };
+    }
+  }
+
+  public async getCommissionAmount(
+    logPrefix: string,
+    addToActionLogs: (message: string) => void
+  ): Promise<{
+    commissionAmountInEth: number;
+    commissionAmount: bigint;
+  }> {
+    var ethUsdRate = null;
+    var commissionAmountInEth = 0.0;
+
+    const defaultEthUsdRate = 0.00001;
+    const minEthCommission = 0.0000005;
+    const maxEthCommission = 0.000005;
+
+    try {
+      const ethUsdRateResult = await this.getCryptoRate("usd", "eth");
+
+      if (ethUsdRateResult.rate > 0) {
+        ethUsdRate = ethUsdRateResult.rate;
+
+      }
+      else {
+        ethUsdRate = defaultEthUsdRate;
+        console.error(`${logPrefix} ETH USD rate is invalid. Using default rate of ` + defaultEthUsdRate);
+      }
+
+      addToActionLogs(`${logPrefix}ETH USD rate for commission: ${ethUsdRate}`);
+    }
+    catch (error: any) {
+      console.error(`${logPrefix}Error getting ETH USD rate: ${error.message}. Using default rate of ` + defaultEthUsdRate);
+      ethUsdRate = defaultEthUsdRate;
+    }
+
+
+
+    const commissionAmountInUsdc = 0.0025;
+    commissionAmountInEth = commissionAmountInUsdc * ethUsdRate;
+
+    if (commissionAmountInEth < minEthCommission) {
+      commissionAmountInEth = minEthCommission;
+      console.error(`${logPrefix} Commission amount in ETH is less than minimum commission. Using minimum commission ` + minEthCommission);
+    }
+
+    if (commissionAmountInEth > maxEthCommission) {
+      commissionAmountInEth = maxEthCommission;
+      console.error(`${logPrefix} Commission amount in ETH is greater than maximum commission. Using maximum commission ` + maxEthCommission);
+    }
+
+
+    addToActionLogs(`${logPrefix}Commission amount in ETH: ${commissionAmountInEth}`);
+
+
+    const commissionAmount = ethers.parseEther(commissionAmountInEth.toFixed(18));
+
+    return {
+      commissionAmountInEth,
+      commissionAmount
+    };
+  }
+
+
   async sendNativeToken(
     fromAddress: string,
     toAddress: string,
@@ -267,25 +454,29 @@ export class CryptoService {
 
       console.log(`${logPrefix}Sending ${amount} ${currency} from ${fromAddress} to ${toAddress}`);
 
-      // Get the RPC provider URL from the database based on the currency
-      const rpcProvider = await this.prisma.rpcProvider.findUnique({
-        where: {
-          currency: currency
-        }
-      });
+      // // Get the RPC provider URL from the database based on the currency
+      // const rpcProvider = await this.prisma.rpcProvider.findUnique({
+      //   where: {
+      //     currency: currency
+      //   }
+      // });
 
-      if (!rpcProvider) {
-        throw new Error(`RPC provider not found for currency: ${currency}`);
-      }
+      // if (!rpcProvider) {
+      //   throw new Error(`RPC provider not found for currency: ${currency}`);
+      // }
 
-      // Get wallet balance before transaction
-      const provider = new ethers.JsonRpcProvider(rpcProvider.networkUrl);
+      // // Get wallet balance before transaction
+      // const provider = new ethers.JsonRpcProvider(rpcProvider.networkUrl);
+
+      const provider = await this.getDefaultRpcProvider();
 
       const balanceBefore = await provider.getBalance(fromAddress);
 
-      if (balanceBefore < ethers.parseEther(amount.toString())) {
+      if (balanceBefore < ethers.parseEther(amount.toFixed(18))) {
         throw new Error(`Insufficient balance for native token transfer. Current balance: ${ethers.formatEther(balanceBefore)} ${currency}`);
       }
+
+      const network = await provider.getNetwork();
 
       // Create a new financial action record
       const financialAction = await this.prisma.financialChatAction.create({
@@ -293,11 +484,11 @@ export class CryptoService {
           accountId: accountId,
           actionType: 'NATIVE_TRANSFER',
           actionInputCurrency: currency,
-          actionInputNetwork: rpcProvider.name,
+          actionInputNetwork: network.name,
           actionInputWallet: fromAddress,
           actionOutputCurrency: currency,
           actionOutputWallet: toAddress,
-          actionOutputNetwork: rpcProvider.name,
+          actionOutputNetwork: network.name,
           actionApprovalType: approvalType,
           actionResult: 'PROCESSING',
           actionResultData: JSON.stringify({
@@ -324,8 +515,9 @@ export class CryptoService {
       // Send the transaction
       const tx = await senderWallet.sendTransaction({
         to: toAddress,
-        value: ethers.parseEther(amount.toString()),
-        nonce: nonce
+        value: ethers.parseEther(amount.toFixed(18)),
+        nonce: nonce,
+        data: ethers.hexlify(ethers.toUtf8Bytes("Peasy - Transfer Native Token"))
       });
 
       // Wait for the transaction to be mined
@@ -338,23 +530,47 @@ export class CryptoService {
       const balanceAfter = await provider.getBalance(fromAddress);
       const recipientBalanceAfter = await provider.getBalance(toAddress);
 
+      var commissionResult = {
+        actualCommissionAmountPaidInEth: 0.0,
+        companyCommissionWallet: process.env.COMPANY_COMMISSION_WALLET
+      };
+
+      var txSuccess = txReceipt != null && txReceipt.status == 1;
+
+      if (txSuccess) {
+        const addToActionLogs = (message: string) => {
+          console.log(`${logPrefix}${message}`);
+        };
+
+        commissionResult = await this.sendCommission(
+          senderWallet,
+          logPrefix,
+          addToActionLogs
+        );
+      }
+
+      const actionResultUserFriendlyMessage = txSuccess ? `Successfully sent ${amount} ${currency} to ${toAddress}. Transaction hash: ${txHash}` 
+      : `Failed to send ${amount} ${currency}: ${txReceipt?.status == 1 ? "SUCCESS" : "FAILED"  }`;
+
       // Update financial action with success status
       await this.prisma.financialChatAction.update({
         where: { id: financialActionId },
         data: {
-          actionResult: 'SUCCESS',
+          actionResult: txSuccess ? 'SUCCESS' : 'FAILED',
           actionResultData: JSON.stringify({
-            status: 'SUCCESS',
+            status: txSuccess ? 'SUCCESS' : 'FAILED',
             txHash: txHash,
             amountSent: amount,
             receipt: txReceipt
           }),
-          actionResultUserFriendlyMessage: `Successfully sent ${amount} ${currency} to ${toAddress}. Transaction hash: ${txHash}`,
+          actionResultUserFriendlyMessage: actionResultUserFriendlyMessage,
           actionResultDate: new Date(),
           actionInputWalletBalanceBefore: parseFloat(ethers.formatEther(balanceBefore)),
           actionInputWalletBalanceAfter: parseFloat(ethers.formatEther(balanceAfter)),
           actionOutputWalletBalanceBefore: null, // We don't have this information
-          actionOutputWalletBalanceAfter: parseFloat(ethers.formatEther(recipientBalanceAfter))
+          actionOutputWalletBalanceAfter: parseFloat(ethers.formatEther(recipientBalanceAfter)),
+          commissionAmountInEth: commissionResult.actualCommissionAmountPaidInEth,
+          commissionWalletAddress: commissionResult.companyCommissionWallet
         }
       });
 
@@ -362,7 +578,7 @@ export class CryptoService {
         amountSent: amount,
         txHash: txHash,
         financialActionId: financialActionId,
-        explorerUrl: rpcProvider.explorerUrl + "/tx/" + txHash
+        explorerUrl: "https://basescan.org/tx/" + txHash
       };
 
       return result;
@@ -469,8 +685,8 @@ export class CryptoService {
         headers
       });
 
-      console.log(`Response status: ${response.status} ${response.statusText}`);
-      console.log(`Response headers: ${JSON.stringify(Object.fromEntries(response.headers))}`);
+      // console.log(`Response status: ${response.status} ${response.statusText}`);
+      // console.log(`Response headers: ${JSON.stringify(Object.fromEntries(response.headers))}`);
 
       if (!response.ok) {
         console.log(`Response status text: ${response.statusText}`);
@@ -582,22 +798,22 @@ export class CryptoService {
     // Generate a random mnemonic (seed phrase)
     const wallet = ethers.Wallet.createRandom();
     const mnemonic = wallet.mnemonic?.phrase;
-    
+
     if (!mnemonic) {
       throw new Error("Failed to generate mnemonic phrase");
     }
-    
+
     // The private key is already derived from the mnemonic in the wallet
     const privateKey = wallet.privateKey;
     const address = wallet.address;
-    
+
     // Convert private key to string format (without 0x prefix)
     const privateKeyHex = privateKey.startsWith('0x') ? privateKey.slice(2) : privateKey;
-    
+
     if (!process.env.KEY_SALT) {
       throw new Error("KEY_SALT is not set");
     }
-    
+
     // Encode both the private key and mnemonic for secure storage
     const encodedPrivateKey = this.encodeSecretKey(privateKeyHex, process.env.KEY_SALT);
     const encodedMnemonic = this.encodeSecretKey(mnemonic, process.env.KEY_SALT);
@@ -629,7 +845,7 @@ export class CryptoService {
    * @throws Error if the user already has a wallet
    */
   async createCryptoWallet(userId: string, username: string, walletNetwork: string, currency: string): Promise<any> {
-    
+
     console.log("***Creating new wallet for user", userId);
 
     const existingWallet = await this.getWallet(userId);
@@ -654,7 +870,7 @@ export class CryptoService {
       }
     });
 
-    console.log("***Wallet created successfully. User ID: ", userId, 
+    console.log("***Wallet created successfully. User ID: ", userId,
       "Username: ", username, "Wallet Network: ", walletNetwork, "Currency: ", currency, "Wallet Address: ", wallet.address);
 
     return wallet;
@@ -667,7 +883,7 @@ export class CryptoService {
       return wallet;
     }
 
-    wallet= await this.createCryptoWallet(userId, username, walletNetwork, currency);
+    wallet = await this.createCryptoWallet(userId, username, walletNetwork, currency);
     return wallet;
   }
   /**
@@ -753,6 +969,16 @@ export class CryptoService {
    */
   async getTokenContractAddress(symbol: string, chainId: number): Promise<string> {
     try {
+      symbol = symbol.toUpperCase();
+
+      // If Base chain, try to get from baseTokenList.json first
+      if (chainId === 8453) {
+        const baseTokenAddress = this.getBaseChainTokenAddressFromList(symbol);
+        if (baseTokenAddress) {
+          return baseTokenAddress;
+        }
+      }
+
       // Try to get from database first
       const token = await this.prisma.cryptoErc20Token.findFirst({
         where: {
@@ -791,23 +1017,26 @@ export class CryptoService {
           1: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48', // Ethereum
           56: '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d', // BSC
           137: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174', // Polygon
+          8453: '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913', // Base
         }
       };
 
-      if (commonTokens[symbol]?.[chainId]) {
+      var contractAddress = commonTokens[symbol]?.[chainId];
+
+      if (contractAddress) {
         // Save this to database for future
         await this.prisma.cryptoErc20Token.create({
           data: {
             symbol,
             name: symbol,
-            contractAddress: commonTokens[symbol][chainId],
+            contractAddress: contractAddress,
             chainId,
             decimals: 18,
             lastUpdated: new Date()
           }
         });
 
-        return commonTokens[symbol][chainId];
+        return contractAddress;
       }
 
       throw new Error(`Token ${symbol} not found for chain ${chainId}`);
@@ -828,28 +1057,32 @@ export class CryptoService {
     formattedBalance: string;
     currency: string;
   }> {
+
     try {
-      // Get the RPC provider URL from the database
-      var rpcProvider = await this.prisma.rpcProvider.findUnique({
-        where: {
-          currency: currency
-        }
-      });
+      currency = currency.toUpperCase();
+      // // Get the RPC provider URL from the database
+      // var rpcProvider = await this.prisma.rpcProvider.findUnique({
+      //   where: {
+      //     currency: currency
+      //   }
+      // });
 
-      if (!rpcProvider) {
-        rpcProvider = await this.prisma.rpcProvider.findUnique({
-          where: {
-            currency: "ETH"
-          }
-        });
-      }
+      // if (!rpcProvider) {
+      //   rpcProvider = await this.prisma.rpcProvider.findUnique({
+      //     where: {
+      //       currency: "ETH"
+      //     }
+      //   });
+      // }
 
-      if (!rpcProvider) {
+      // if (!rpcProvider) {
 
-        throw new Error(`RPC provider not found for currency: ${currency}`);
-      }
+      //   throw new Error(`RPC provider not found for currency: ${currency}`);
+      // }
 
-      const provider = new ethers.JsonRpcProvider(rpcProvider.networkUrl);
+      // const provider = new ethers.JsonRpcProvider(rpcProvider.networkUrl);
+
+      const provider = await this.getDefaultRpcProvider();
       const network = await provider.getNetwork();
       const chainId = Number(network.chainId);
 
@@ -857,7 +1090,7 @@ export class CryptoService {
       let decimals: number;
 
       // Check if this is a native token based on the provider configuration
-      if (rpcProvider.isNative) {
+      if (currency.toUpperCase() === "ETH") {
         // For native tokens like ETH, use getBalance directly
         balance = await provider.getBalance(walletAddress);
         decimals = 18; // Most native tokens use 18 decimals
@@ -867,8 +1100,30 @@ export class CryptoService {
 
         // Define ERC20 Token ABI - only the methods we need
         const erc20Abi = [
-          "function balanceOf(address owner) view returns (uint256)",
-          "function decimals() view returns (uint8)"
+          {
+            name: 'approve',
+            type: 'function',
+            inputs: [
+              { name: 'spender', type: 'address' },
+              { name: 'amount', type: 'uint256' }
+            ],
+            outputs: [{ type: 'bool' }],
+            stateMutability: 'nonpayable'
+          },
+          {
+            name: 'decimals',
+            type: 'function',
+            inputs: [],
+            outputs: [{ type: 'uint8' }],
+            stateMutability: 'view'
+          },
+          {
+            name: 'balanceOf',
+            type: 'function',
+            inputs: [{ name: 'owner', type: 'address' }],
+            outputs: [{ type: 'uint256' }],
+            stateMutability: 'view'
+          }
         ];
 
         // Create contract instance with proper typing
@@ -899,6 +1154,122 @@ export class CryptoService {
       };
     } catch (error: any) {
       console.error(`Error getting wallet balance: ${error.message}`);
+      throw error;
+    }
+  }
+
+  async getWalletBalanceFromCoinbase(walletAddress: string, currency: string): Promise<any> {
+
+    currency = currency.toUpperCase();
+    try {
+      Coinbase.configure({
+        apiKeyName: process.env.COINBASE_API_KEY_NAME!,
+        privateKey: process.env.COINBASE_API_KEY_PRIVATE!
+      });
+      const senderMnemonic = await this.getWalletMnemonic(walletAddress);
+      const coinbaseWallet = await Wallet.import({
+        mnemonicPhrase: senderMnemonic
+      }, Coinbase.networks.BaseMainnet);
+
+      const assetId = await this.getCoinbaseCurrencyAssetId(currency);
+      console.log(`Asset ID for ${currency}: ${assetId}`);
+      const balance = await coinbaseWallet.getBalance(currency);
+
+      return {
+        balance: balance.toString(),
+        currency: currency.toUpperCase()
+      };
+    } catch (error: any) {
+      console.error(`Error getting wallet balance from Coinbase: ${error.message}`);
+      throw error;
+    }
+  }
+  
+
+  async getWalletBalanceForAllCoinsFromCoinbase(walletAddress: string): Promise<any> {
+    try {
+      Coinbase.configure({
+        apiKeyName: process.env.COINBASE_API_KEY_NAME!,
+        privateKey: process.env.COINBASE_API_KEY_PRIVATE!
+      });
+      const senderMnemonic = await this.getWalletMnemonic(walletAddress);
+      const coinbaseWallet = await Wallet.import({
+        mnemonicPhrase: senderMnemonic
+      }, Coinbase.networks.BaseMainnet);
+
+      const balances = await coinbaseWallet.listBalances();
+      const balancesArray: any[] = [];
+      var userFriendlyBalanceMessage = "";
+
+      balances.forEach((balance, currency) => {
+        balancesArray.push({
+          currency: currency.toUpperCase(),
+          balance: balance.toString() // Convert Decimal to string to avoid serialization issues
+        });
+
+        userFriendlyBalanceMessage += `${currency.toUpperCase()}: ${balance.toString()}\n`;
+      });
+
+      console.log(`Balances: ${JSON.stringify(balancesArray)}`);
+      return {
+        balances: balancesArray,
+        userFriendlyBalanceMessage: userFriendlyBalanceMessage
+      };
+
+    } catch (error: any) {
+      console.error(`Error getting wallet balances: ${error.message}`);
+      throw error;
+    }
+  }
+
+  async getWalletBalanceForAllCoinsFromCoinbaseWithTotalUsd(walletAddress: string): Promise<any> {
+    try {
+      Coinbase.configure({
+        apiKeyName: process.env.COINBASE_API_KEY_NAME!,
+        privateKey: process.env.COINBASE_API_KEY_PRIVATE!
+      });
+      const senderMnemonic = await this.getWalletMnemonic(walletAddress);
+      const coinbaseWallet = await Wallet.import({
+        mnemonicPhrase: senderMnemonic
+      }, Coinbase.networks.BaseMainnet);
+
+      const balances = await coinbaseWallet.listBalances();
+      const balancesArray: any[] = [];
+      var userFriendlyBalanceMessage = "";
+
+      balances.forEach((balance, currency) => {
+        balancesArray.push({
+          currency: currency.toUpperCase(),
+          balance: balance.toString() // Convert Decimal to string to avoid serialization issues
+        });
+      });
+
+      var totalUsd = 0.0;
+      for (var i = 0; i < balancesArray.length; i++) {
+        const item = balancesArray[i];
+        const rate = await this.getCryptoRate(item.currency, "USD");
+        item.usd = item.balance * rate.rate;
+        totalUsd += item.usd;
+      }
+
+      //sort balancesArray by usd in descending order
+      balancesArray.sort((a, b) => b.usd - a.usd);
+
+      for (var i = 0; i < balancesArray.length; i++) {
+        const item = balancesArray[i];
+        userFriendlyBalanceMessage += `${item.currency} ${item.balance} --> (${item.usd} USD)\n`;
+      }
+
+      userFriendlyBalanceMessage += `------\nTotal: ${totalUsd} USD`;
+      console.log(`Balances: ${JSON.stringify(balancesArray)}`);
+      return {
+        balances: balancesArray,
+        totalUsd: totalUsd,
+        userFriendlyBalanceMessage: userFriendlyBalanceMessage
+      };
+
+    } catch (error: any) {
+      console.error(`Error getting wallet balances: ${error.message}`);
       throw error;
     }
   }
@@ -1063,15 +1434,13 @@ export class CryptoService {
   }
 
   private encrypt(text: string, iv: Buffer) {
-    console.log("ENCRYPTION_KEY: ", process.env.ENCRYPTION_KEY);
     const key = Buffer.from(process.env.ENCRYPTION_KEY!, 'utf8');
     console.log(key.toString('hex'));
     const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
     return cipher.update(text, "utf8", "hex") + cipher.final("hex");
-}
+  }
 
   private decrypt(encrypted: string, iv: Buffer) {
-    console.log("ENCRYPTION_KEY: ", process.env.ENCRYPTION_KEY);
     const key = Buffer.from(process.env.ENCRYPTION_KEY!, 'utf8');
     const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
     return decipher.update(encrypted, "hex", "utf8") + decipher.final("utf8");
@@ -1084,163 +1453,169 @@ export class CryptoService {
    * @param amount The amount to swap
    * @returns Quote information from Coinbase
    */
-  async getSwapCryptoQuote(fromCurrency: string, toCurrency: string, amount: number, walletAddress: string): Promise < any > {
-  console.log(`Getting swap quote from ${fromCurrency} to ${toCurrency} for amount ${amount}`);
+  async getSwapCryptoQuote(fromCurrency: string, toCurrency: string, amount: number, walletAddress: string): Promise<any> {
+    console.log(`Getting swap quote from ${fromCurrency} to ${toCurrency} for amount ${amount}`);
 
 
-  try {
-    Coinbase.configure({
-      apiKeyName: process.env.COINBASE_API_KEY_NAME!,
-      privateKey: process.env.COINBASE_API_KEY_PRIVATE!
-    });
-    const senderMnemonic = await this.getWalletMnemonic(walletAddress);
-    const coinbaseWallet = await Wallet.import({ networkId: "base-mainnet", mnemonicPhrase: senderMnemonic });
+    try {
+      Coinbase.configure({
+        apiKeyName: process.env.COINBASE_API_KEY_NAME!,
+        privateKey: process.env.COINBASE_API_KEY_PRIVATE!
+      });
+      const senderMnemonic = await this.getWalletMnemonic(walletAddress);
+      const coinbaseWallet = await Wallet.import({
+        mnemonicPhrase: senderMnemonic
+      }, Coinbase.networks.BaseMainnet);
 
-    const iv = crypto.randomBytes(16);
-    const encryptedWalletData = this.encrypt(JSON.stringify(coinbaseWallet.export()), iv);
+      const iv = crypto.randomBytes(16);
+      const encryptedWalletData = this.encrypt(JSON.stringify(coinbaseWallet.export()), iv);
 
-    const ivString = iv.toString("hex");
-    console.log("ivString: ", ivString, "encryptedWalletData", encryptedWalletData);
+      const ivString = iv.toString("hex");
+      console.log("ivString: ", ivString, "encryptedWalletData", encryptedWalletData);
 
 
 
-    const fromCurrencyId = this.getCoinbaseAssetId(fromCurrency);
-    console.log(`From currency ID for ${fromCurrency}: ${fromCurrencyId}`);
-    const toCurrencyId = this.getCoinbaseAssetId(toCurrency);
-    console.log(`To currency ID for ${toCurrency}: ${toCurrencyId}`);
+      const fromCurrencyId = await this.getCoinbaseAssetId(fromCurrency);
+      console.log(`From currency ID for ${fromCurrency}: ${fromCurrencyId}`);
+      const toCurrencyId = await this.getCoinbaseAssetId(toCurrency);
+      console.log(`To currency ID for ${toCurrency}: ${toCurrencyId}`);
 
-    const trade = await coinbaseWallet.createTrade({
-      fromAssetId: fromCurrencyId,
-      toAssetId: toCurrencyId,
-      amount: amount
-    });
+      const trade = await coinbaseWallet.createTrade({
+        fromAssetId: fromCurrencyId,
+        toAssetId: toCurrencyId,
+        amount: amount
+      });
 
-    console.log(`Trade: ${JSON.stringify(trade)}`);
+      console.log(`Trade: ${JSON.stringify(trade)}`);
 
-    return trade;
+      return trade;
 
-  } catch(error) {
-    console.error(`Error getting swap quote from Coinbase: ${error}`);
-    throw error;
+    } catch (error) {
+      console.error(`Error getting swap quote from Coinbase: ${error}`);
+      throw error;
+    }
   }
-}
 
   /**
    * Get asset ID for a specific cryptocurrency from Coinbase API
    * @param currency The cryptocurrency code (e.g., 'BTC', 'ETH')
    * @returns Asset ID for the given currency
    */
-  async getCoinbaseCurrencyAssetId(currency: string): Promise < string > {
-  try {
-    const logPrefix = `[CryptoService.getCoinbaseCurrencyAssetId] `;
-    console.log(`${logPrefix}Getting asset ID for ${currency}`);
+  async getCoinbaseCurrencyAssetId(currency: string): Promise<string> {
+    try {
+      currency = currency.toUpperCase();
+      const logPrefix = `[CryptoService.getCoinbaseCurrencyAssetId] `;
+      console.log(`${logPrefix}Getting asset ID for ${currency}`);
 
-    // Connect to Redis
-    const redis = this.getRedisClient();
-    await redis.connect();
+      // Connect to Redis
+      const redis = this.getRedisClient();
+      await redis.connect();
 
-    const cacheKey = 'coinbase:currencies';
-    const currencyCacheKey = `${cacheKey}:${currency}`;
+      const cacheKey = 'coinbase:currencies';
+      const currencyCacheKey = `${cacheKey}:${currency}`;
 
-    // Try to get asset ID from Redis cache first
-    const cachedAssetId = await redis.get(currencyCacheKey);
+      // Try to get asset ID from Redis cache first
+      const cachedAssetId = await redis.get(currencyCacheKey);
 
-    if(cachedAssetId) {
-      console.log(`${logPrefix}Found cached asset ID for ${currency}: ${cachedAssetId}`);
-      await redis.quit();
-      return cachedAssetId;
-    }
+      if (cachedAssetId) {
+        console.log(`${logPrefix}Found cached asset ID for ${currency}: ${cachedAssetId}`);
+        await redis.quit();
+        return cachedAssetId;
+      }
 
       // Check if we need to fetch all currencies
       const lastUpdated = await redis.get(`${cacheKey}:last-updated`);
-    const now = Date.now();
-    const oneHour = 3600000; // 1 hour in milliseconds
+      const now = Date.now();
+      const oneHour = 3600000; // 1 hour in milliseconds
 
-    // If cache doesn't exist or is expired (1 hour), fetch all currencies
-    if(!lastUpdated || (now - parseInt(lastUpdated)) > oneHour) {
-  console.log(`${logPrefix}Cache expired or not found, fetching currencies from Coinbase API`);
+      // If cache doesn't exist or is expired (1 hour), fetch all currencies
+      if (!lastUpdated || (now - parseInt(lastUpdated)) > oneHour) {
+        console.log(`${logPrefix}Cache expired or not found, fetching currencies from Coinbase API`);
 
-  // Fetch all crypto currencies from Coinbase API
-  const response = await fetch('https://api.coinbase.com/v2/currencies/crypto');
+        // Fetch all crypto currencies from Coinbase API
+        const response = await fetch('https://api.coinbase.com/v2/currencies/crypto');
 
-  if (!response.ok) {
-    throw new Error(`Failed to fetch currencies: ${response.statusText}`);
-  }
+        if (!response.ok) {
+          throw new Error(`Failed to fetch currencies: ${response.statusText}`);
+        }
 
-  const data = await response.json();
+        const data = await response.json();
 
-  if (!data.data || !Array.isArray(data.data)) {
-    throw new Error('Invalid response format from Coinbase API');
-  }
+        if (!data.data || !Array.isArray(data.data)) {
+          throw new Error('Invalid response format from Coinbase API');
+        }
 
-  // Store all currencies in Redis with 1 hour expiration
-  const currencies = data.data;
+        // Store all currencies in Redis with 1 hour expiration
+        const currencies = data.data;
 
-  // Store the full list
-  await redis.set(cacheKey, JSON.stringify(currencies), { EX: 3600 });
+        // Store the full list
+        await redis.set(cacheKey, JSON.stringify(currencies), { EX: 3600 });
 
-  // Store last update timestamp
-  await redis.set(`${cacheKey}:last-updated`, now.toString(), { EX: 3600 });
+        // Store last update timestamp
+        await redis.set(`${cacheKey}:last-updated`, now.toString(), { EX: 3600 });
 
-  // Store individual currencies by code for faster lookups
-  for (const curr of currencies) {
-    if (curr.code && curr.asset_id) {
-      await redis.set(`${cacheKey}:${curr.code}`, curr.asset_id, { EX: 3600 });
+        // Store individual currencies by code for faster lookups
+        for (const curr of currencies) {
+          if (curr.code && curr.asset_id) {
+            await redis.set(`${cacheKey}:${curr.code.toUpperCase()}`, curr.asset_id, { EX: 3600 });
+          }
+        }
+
+        console.log(`${logPrefix}Cached ${currencies.length} currencies in Redis`);
+
+        // Find the requested currency
+        const targetCurrency = currencies.find((c: any) => c.code.toUpperCase() === currency);
+
+        await redis.quit();
+
+        if (!targetCurrency) {
+          throw new Error(`Currency ${currency} not found in Coinbase API`);
+        }
+
+        return targetCurrency.asset_id;
+      }
+
+      // Fetch all currencies from cache and find the requested one
+      const cachedCurrencies = await redis.get(cacheKey);
+
+      if (!cachedCurrencies) {
+        // This shouldn't happen, but just in case
+        await redis.quit();
+        throw new Error('Cache inconsistency: currencies list not found');
+      }
+
+      const currencies = JSON.parse(cachedCurrencies);
+      const targetCurrency = currencies.find((c: any) => c.code.toUpperCase() === currency);
+
+      if (!targetCurrency) {
+        await redis.quit();
+        throw new Error(`Currency ${currency} not found in cached currencies`);
+      }
+
+      // Cache this currency for future lookups
+      await redis.set(currencyCacheKey, targetCurrency.asset_id, { EX: 3600 });
+
+      await redis.quit();
+
+      return targetCurrency.asset_id;
+    } catch (error: any) {
+      console.error(`Error getting Coinbase currency asset ID: ${error.message}`);
+      throw error;
     }
   }
 
-  console.log(`${logPrefix}Cached ${currencies.length} currencies in Redis`);
-
-  // Find the requested currency
-  const targetCurrency = currencies.find((c: any) => c.code === currency);
-
-  await redis.quit();
-
-  if (!targetCurrency) {
-    throw new Error(`Currency ${currency} not found in Coinbase API`);
-  }
-
-  return targetCurrency.asset_id;
-}
-
-// Fetch all currencies from cache and find the requested one
-const cachedCurrencies = await redis.get(cacheKey);
-
-if (!cachedCurrencies) {
-  // This shouldn't happen, but just in case
-  await redis.quit();
-  throw new Error('Cache inconsistency: currencies list not found');
-}
-
-const currencies = JSON.parse(cachedCurrencies);
-const targetCurrency = currencies.find((c: any) => c.code === currency);
-
-if (!targetCurrency) {
-  await redis.quit();
-  throw new Error(`Currency ${currency} not found in cached currencies`);
-}
-
-// Cache this currency for future lookups
-await redis.set(currencyCacheKey, targetCurrency.asset_id, { EX: 3600 });
-
-await redis.quit();
-
-return targetCurrency.asset_id;
-    } catch (error: any) {
-  console.error(`Error getting Coinbase currency asset ID: ${error.message}`);
-  throw error;
-}
-  }
-
-  public getCoinbaseSupportedSwapCurrencies(): string[] {
-    return ['eth', 'wei', 'gwei', 'usdc', 'weth', 'sol', 'lamport', 'eurc', 'cbbtc'];
-  }
+  // public getCoinbaseSupportedSwapCurrencies(): string[] {
+  //   return ['eth', 'wei', 'gwei', 'usdc', 'weth', 'sol', 'lamport', 'eurc', 'cbbtc'];
+  // }
 
 
-  private getCoinbaseAssetId(currency: string): string {
+  private async getCoinbaseAssetId(currency: string): Promise<string> {
+    var id = await this.getCoinbaseCurrencyAssetId(currency);
+    console.log("Currency: ", currency, "Asset id: ", id);
+    return id;
     // Normalize to lowercase for case-insensitive matching
     const normalizedCurrency = currency.toLowerCase();
-    
+
     switch (normalizedCurrency) {
       case 'eth':
         return Coinbase.assets.Eth;
@@ -1264,4 +1639,271 @@ return targetCurrency.asset_id;
         throw new Error(`Unsupported currency: ${currency}. Only eth, wei, gwei, usdc, weth, sol, lamport, eurc, and cbbtc are supported.`);
     }
   }
+
+  /**
+   * Generate a JWT token for Coinbase API authentication
+   * @param requestMethod The HTTP request method (GET, POST, etc.)
+   * @param requestHost The host URL for the request
+   * @param requestPath The API endpoint path
+   * @returns A JWT token for use in the Authorization header
+   */
+  generateJwtForCoinbase(requestMethod: string, requestHost: string, requestPath: string): string {
+    const keyName = process.env.COINBASE_API_KEY_NAME!;
+    const keySecret = process.env.COINBASE_API_KEY_SECRET!;
+    const algorithm = 'ES256';
+
+    // Construct the URI
+    const uri = `${requestMethod} ${requestHost}${requestPath}`;
+
+    // Create the JWT payload
+    const payload = {
+      iss: 'cdp',
+      nbf: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + 120, // JWT expires in 120 seconds
+      sub: keyName,
+      uri,
+    };
+
+    // Create the JWT header
+    const header = {
+      alg: algorithm,
+      kid: keyName,
+      nonce: crypto.randomBytes(16).toString('hex'),
+    };
+
+    // Sign and return the JWT
+    return jwt.sign(payload, keySecret, { algorithm, header });
+  }
+
+  /**
+   * Create a new trade on Coinbase using the CDP API
+   * @param walletAddress The wallet address to perform the trade
+   * @param fromCurrency The source cryptocurrency
+   * @param toCurrency The target cryptocurrency
+   * @param amount The amount to swap
+   * @param userId The ID of the user initiating the trade
+   * @param approvalType The approval type for the trade
+   * @returns The created trade details
+   */
+  async createTradeInCoinbase(
+    walletAddress: string,
+    fromCurrency: string,
+    toCurrency: string,
+    amount: number,
+    userId: string,
+    approvalType: string
+  ): Promise<any> {
+    let financialActionId: string | null = null;
+    const logPrefix = `[CryptoService.createTradeInCoinbase] `;
+
+    try {
+      console.log(`${logPrefix}Creating trade from ${fromCurrency} to ${toCurrency} for amount ${amount}`);
+
+      // Configure Coinbase SDK
+      Coinbase.configure({
+        apiKeyName: process.env.COINBASE_API_KEY_NAME!,
+        privateKey: process.env.COINBASE_API_KEY_PRIVATE!
+      });
+
+      // Get wallet mnemonic
+      const senderMnemonic = await this.getWalletMnemonic(walletAddress);
+
+      // Create a new financial action record
+      const financialAction = await this.prisma.financialChatAction.create({
+        data: {
+          accountId: userId,
+          actionType: 'CRYPTO_SWAP',
+          actionInputCurrency: fromCurrency,
+          actionInputNetwork: 'Coinbase',
+          actionInputWallet: walletAddress,
+          actionOutputCurrency: toCurrency,
+          actionOutputWallet: walletAddress,
+          actionOutputNetwork: 'Coinbase',
+          actionApprovalType: approvalType,
+          actionResult: 'PROCESSING',
+          actionResultData: JSON.stringify({
+            status: 'PROCESSING',
+            message: `Initiating swap of ${amount} ${fromCurrency} to ${toCurrency}`
+          }),
+          actionResultUserFriendlyMessage: `Processing your swap of ${amount} ${fromCurrency} to ${toCurrency}...`
+        }
+      });
+
+      financialActionId = financialAction.id;
+
+      // Import wallet using mnemonic phrase
+      const coinbaseWallet = await Wallet.import({
+        mnemonicPhrase: senderMnemonic
+      }, Coinbase.networks.BaseMainnet);
+
+      console.log(`${logPrefix}Network ID: ${coinbaseWallet.getNetworkId()}`);
+
+      // Get asset IDs for the currencies
+      var fromCurrencyId = await this.getCoinbaseAssetId(fromCurrency);
+      var toCurrencyId = await this.getCoinbaseAssetId(toCurrency);
+
+      // fromCurrencyId = Coinbase.assets.Eth; //          "ETH", // fromCurrency
+      // toCurrencyId = Coinbase.assets.Usdc; // "USDC",  // toCurrency (using CBBTC which is Coinbase's wrapped BTC)
+
+      console.log(`${logPrefix}From currency ID for ${fromCurrency}: ${fromCurrencyId}`);
+      console.log(`${logPrefix}To currency ID for ${toCurrency}: ${toCurrencyId}`);
+
+      // Get balance before trade
+      const balanceBefore = await coinbaseWallet.getBalance(fromCurrencyId);
+      console.log(`${logPrefix}Balance before trade: ${JSON.stringify(balanceBefore)}`);
+
+      // Create the trade
+      const trade = await coinbaseWallet.createTrade({
+        fromAssetId: "ETH",
+        toAssetId: "SOL",
+        amount: amount
+      }) as Trade;
+
+      console.log(`${logPrefix}Trade created: ${JSON.stringify(trade)}`);
+
+      // Get balances after trade
+      const balanceAfterFrom = await coinbaseWallet.getBalance(fromCurrencyId);
+      const balanceAfterTo = await coinbaseWallet.getBalance(toCurrencyId);
+
+      // Convert balances to string
+      const balanceBeforeStr = balanceBefore ? balanceBefore.toString() : '0';
+      const balanceAfterFromStr = balanceAfterFrom ? balanceAfterFrom.toString() : '0';
+      const balanceAfterToStr = balanceAfterTo ? balanceAfterTo.toString() : '0';
+
+      // Update financial action with success status
+      await this.prisma.financialChatAction.update({
+        where: { id: financialActionId },
+        data: {
+          actionResult: 'SUCCESS',
+          actionResultData: JSON.stringify({
+            status: 'SUCCESS',
+            tradeId: trade.id || '',
+            amountSent: amount,
+            trade: JSON.stringify(trade)
+          }),
+          actionResultUserFriendlyMessage: `Successfully swapped ${amount} ${fromCurrency} to ${toCurrency}.`,
+          actionResultDate: new Date(),
+          actionInputWalletBalanceBefore: parseFloat(balanceBeforeStr),
+          actionInputWalletBalanceAfter: parseFloat(balanceAfterFromStr),
+          actionOutputWalletBalanceBefore: null,
+          actionOutputWalletBalanceAfter: parseFloat(balanceAfterToStr)
+        }
+      });
+
+      return {
+        tradeId: trade.id || '',
+        fromCurrency,
+        toCurrency,
+        amountSent: amount,
+        amountReceived: trade.toAssetAmount || 0,
+        exchangeRate: (trade.toAssetAmount || 0) / amount,
+        financialActionId,
+        status: trade.status || 'COMPLETED'
+      };
+    } catch (error: any) {
+      console.error(`${logPrefix}Error creating trade on Coinbase: ${error.message || error.apiMessage || error}`);
+
+      // Update financial action with error status if it was created
+      if (financialActionId) {
+        await this.prisma.financialChatAction.update({
+          where: { id: financialActionId },
+          data: {
+            actionResult: 'ERROR',
+            actionResultData: JSON.stringify({
+              status: 'ERROR',
+              error: error.message,
+              stack: error.stack
+            }),
+            actionResultUserFriendlyMessage: `Failed to swap ${amount} ${fromCurrency} to ${toCurrency}: ${error.message}`,
+            actionResultDate: new Date()
+          }
+        });
+      }
+
+      throw error;
+    }
+  }
+
+  public async getDefaultRpcProvider(): Promise<ethers.JsonRpcProvider> {
+    const rpcProvider = await this.prisma.rpcProvider.findUnique({
+      where: {
+        currency: "ETH"
+      }
+    });
+
+    const provider = new ethers.JsonRpcProvider(rpcProvider.networkUrl);
+    return provider;
+  }
+
+  private getBaseChainTokenAddressFromList(symbol: string): string | null {
+    try {
+      //Token list is taken from: https://github.com/sushiswap/list/blob/master/lists/token-lists/default-token-list/tokens/base.json
+      const tokenListPath = path.resolve(process.cwd(), 'src', 'server', 'services', 'data', 'baseTokenList.json');
+      var tokenList = JSON.parse(fs.readFileSync(tokenListPath, 'utf8'));
+
+
+      // var manuallyAddedTokens = [
+      //   {
+      //     "address": "0x2f6c17fa9f9bC3600346ab4e48C0701e1d5962AE",
+      //     "chainId": 8453,
+      //     "decimals": 18,
+      //     "logoURI": "https://raw.githubusercontent.com/sushiswap/list/master/logos/token-logos/network/base/0x2f6c17fa9f9bC3600346ab4e48C0701e1d5962AE.jpg",
+      //     "name": "Based Fartcoin",
+      //     "symbol": "Fartcoin"
+      //   }
+      // ]
+
+      // tokenList = tokenList.concat(manuallyAddedTokens);
+
+      const token = tokenList.find(
+        (t: any) => t.symbol.toUpperCase() === symbol.toUpperCase() && t.chainId === 8453
+      );
+      return token ? token.address : null;
+    } catch (err) {
+      console.error('Error reading baseTokenList.json:', err);
+      return null;
+    }
+  }
+
+  /**
+ * Get token contract address from blockchain explorer API
+ * @param chainId The blockchain network ID
+ * @returns Token contract address or null if not found
+ */
+public async getAllTokenAddressesFromExplorer(chainId: number): Promise<string | null> {
+  try {
+    // Get the appropriate API key and base URL for the chain
+    let apiKey = '';
+    let baseUrl = '';
+    
+    if (chainId === 8453) { // Base
+      apiKey = process.env.BASESCAN_API_KEY || '';
+      baseUrl = 'https://api.basescan.org/api';
+    // } else if (chainId === 1) { // Ethereum
+    //   apiKey = process.env.ETHERSCAN_API_KEY || '';
+    //   baseUrl = 'https://api.etherscan.io/api';
+    } else {
+      return null; // Unsupported chain
+    }
+
+    // Query the explorer API to search for token by symbol
+    const response = await fetch(`${baseUrl}?module=token&action=tokenlist&apikey=${apiKey}`);
+    
+    if (!response.ok) {
+      throw new Error(`Explorer API error: ${response.statusText}`);
+    }
+    
+    const data = await response.json();
+    
+    if (data.status !== '1' || !Array.isArray(data.result)) {
+      return null;
+    }
+    
+    return data.result;
+  } catch (error) {
+    console.error(`Error fetching token address from explorer: ${error}`);
+    return null;
+  }
+}
+
 } 

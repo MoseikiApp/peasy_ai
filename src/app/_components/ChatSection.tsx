@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useMemo } from "react";
 import { api } from "~/trpc/react";
 import { format, isToday } from "date-fns";
 
@@ -14,6 +14,8 @@ type Message = {
 export function ChatSection() {
   const [message, setMessage] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [tradeStatus, setTradeStatus] = useState<"idle" | "loading" | "success" | "error">("idle");
+  const [tradeResult, setTradeResult] = useState<any>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
 
@@ -29,8 +31,11 @@ export function ChatSection() {
       }
     );
 
-  // Flatten messages from all pages
-  const messages = data?.pages.flatMap((page) => page.messages) || [];
+  // Memoize the flattened messages array
+  const messages = useMemo(() => 
+    data?.pages.flatMap((page) => page.messages) || [],
+    [data?.pages]
+  );
 
   // Mutation to send a message
   const sendMessageMutation = api.chat.sendMessage.useMutation({
@@ -38,6 +43,18 @@ export function ChatSection() {
       setMessage("");
       void refetch();
     },
+  });
+
+  // Mutation to test trade
+  const testTradeMutation = api.chat.testTrade.useMutation({
+    onSuccess: (data) => {
+      setTradeStatus("success");
+      setTradeResult(data);
+    },
+    onError: (error) => {
+      setTradeStatus("error");
+      setTradeResult({ error: error.message });
+    }
   });
 
   // Scroll to bottom when messages change
@@ -77,6 +94,17 @@ export function ChatSection() {
     }
   };
 
+  // Handle test trade button click
+  const handleTestTrade = async () => {
+    setTradeStatus("loading");
+    try {
+      await testTradeMutation.mutateAsync();
+    } catch (error) {
+      console.error("Test trade failed:", error);
+      setTradeStatus("error");
+    }
+  };
+
   return (
     <div className="w-full max-w-4xl bg-white/10 rounded-xl overflow-hidden">
       <div className="p-4 bg-[#2e026d] border-b border-white/20">
@@ -103,7 +131,7 @@ export function ChatSection() {
                   : "mr-auto bg-[#2e026d] rounded-tr-xl rounded-br-xl rounded-tl-xl"
               } p-3 shadow-md`}
             >
-              <div className="text-white">{msg.chatContent}</div>
+              <div className="text-white whitespace-pre-wrap">{msg.chatContent}</div>
               <div className="text-xs text-white/70 mt-1 self-end">
                 {isToday(new Date(msg.date)) 
                   ? format(new Date(msg.date), "HH:mm")
@@ -149,6 +177,72 @@ export function ChatSection() {
           </svg>
         </button>
       </form>
+      
+      {/* Test Trade Button */}
+      <div className="p-4 border-t border-white/20 flex justify-center">
+        <button
+          onClick={handleTestTrade}
+          className="rounded-full bg-[hsl(280,100%,70%)] px-4 py-2 text-white disabled:opacity-50 hover:bg-[hsl(280,100%,60%)]"
+          disabled={tradeStatus === "loading"}
+        >
+          {tradeStatus === "loading" ? "Processing..." : "Test Trade (Buy 0.0001 BTC with USDC)"}
+        </button>
+      </div>
+      
+      {/* Trade Result Display */}
+      {(tradeStatus === "success" || tradeStatus === "error") && (
+        <div className={`p-4 ${tradeStatus === "success" ? "bg-green-900/50" : "bg-red-900/50"} border-t border-white/20`}>
+          <h3 className="font-bold mb-2">
+            {tradeStatus === "success" && tradeResult.success ? "Trade Successful" : "Trade Failed"}
+          </h3>
+          <div className="text-sm overflow-auto max-h-[200px] bg-black/30 p-4 rounded whitespace-pre-line">
+            {tradeResult.isSuccess ? (
+              <>
+                <div className="text-green-400 font-semibold mb-2">Transaction completed successfully</div>
+                <div>
+                  {Object.entries(tradeResult).map(([key, value]) => (
+                    <div key={key} className="mb-2">
+                      <span className="font-medium text-gray-300">{key}: </span>
+                      {typeof value === 'object' ? (
+                        <pre className="ml-4 text-xs overflow-x-auto mt-1 bg-black/20 p-2 rounded">
+                          {JSON.stringify(value, null, 2)}
+                        </pre>
+                      ) : (
+                        <span>{String(value)}</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="text-red-400 font-semibold mb-2">Transaction failed</div>
+                <div className="mb-2">{tradeResult.error?.split('\n\n')[0]}</div>
+                {tradeResult.error?.includes('Raw Call Arguments:') && (
+                  <>
+                    <div className="font-medium text-gray-300 mt-3 mb-1">Transaction Details:</div>
+                    {tradeResult.error
+                      .split('Raw Call Arguments:')[1]
+                      .split('\n')
+                      .filter((line: string) => line.trim())
+                      .map((line: string, i: number) => (
+                        <div key={i} className="ml-2 mb-1">{line.trim()}</div>
+                      ))}
+                  </>
+                )}
+                {tradeResult.error?.includes('Details:') && (
+                  <div className="mt-3">
+                    <span className="font-medium text-gray-300">Error: </span>
+                    <span className="text-red-300">
+                      {tradeResult.error.split('Details:')[1].split('\n')[0].trim()}
+                    </span>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 } 

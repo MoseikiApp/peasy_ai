@@ -1,4 +1,5 @@
 import { PrismaAdapter } from "@auth/prisma-adapter";
+import { Coinbase } from "@coinbase/coinbase-sdk";
 import { type DefaultSession, type NextAuthConfig } from "next-auth";
 import DiscordProvider from "next-auth/providers/discord";
 // import TwitterProvider from "next-auth/providers/twitter";
@@ -143,7 +144,7 @@ export const authConfig = {
             await cryptoService.createCryptoWallet(
               user.id!,
               user.name || `user-${user.id}`,
-              'ethereum',
+              Coinbase.networks.BaseMainnet,
               'ETH'
             );
           }

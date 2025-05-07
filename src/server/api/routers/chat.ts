@@ -6,6 +6,11 @@ import {
 } from "~/server/api/trpc";
 import { GptService } from "~/server/services/GptService";
 import { CryptoService } from "~/server/services/CryptoService";
+import { Coinbase } from "@coinbase/coinbase-sdk";
+import { ethers } from "ethers";
+import { SwingService } from "~/server/services/SwingService";
+import { TelegramService } from "~/server/services/TelegramService";
+import { WebhookService } from "~/server/services/WebhookService";
 
 // Initialize the GptService
 const gptService = new GptService();
@@ -101,7 +106,7 @@ export const chatRouter = createTRPCRouter({
         await cryptoService.createCryptoWallet(
           accountId,
           ctx.session.user.name || `user-${accountId}`,
-          'ethereum',
+          Coinbase.networks.BaseMainnet,
           'ETH'
         );
       }
@@ -269,12 +274,12 @@ export const chatRouter = createTRPCRouter({
 
             if (!userWallet) {
               currentStep = "creating your wallet";
-              
+
               const cryptoService = new CryptoService(ctx.db);
               userWallet = await cryptoService.createCryptoWallet(
                 user.id!,
                 user.name || `user-${user.id}`,
-                'ethereum',
+                Coinbase.networks.BaseMainnet,
                 'ETH'
               );
             }
@@ -376,202 +381,58 @@ export const chatRouter = createTRPCRouter({
   handleTextMessageWebhook: publicProcedure
     .input(z.any())
     .mutation(async ({ ctx, input }) => {
-      console.log("Received text message webhook", input);
-      var currentStep = "processing your request";
-      var channel = input.channel;
-      var provider = input.provider;
+      console.log("Received text message webhook", JSON.stringify(input, null, 2));
 
-      console.log("Channel:", channel, "Provider:", provider);
+      const webhookService = new WebhookService(ctx.db);
 
-      const typedInput = {
-        eventType: "chatMessage",
-        phoneNumberWithCountryCode: input.message.from.id.toString(),
-        accountSid: input.message.from.id.toString(),
-        waId: input.message.from.id.toString(),
-        body: input.message.text,
-        chatExternalId: input.message.from.id.toString(),
-        chatExternalConversationId: input.message.chat.id.toString(),
-        dateCreated: new Date(input.message.date * 1000),
-        firstName: input.message.from.first_name,
+      void webhookService.processMessage(ctx, input).catch(err => {
+        console.error("Background webhook processing failed:", err);
+      });
+
+      return {
+        status: 'success',
+        message: 'processing...'
       };
+    }),
+
+  testTrade: protectedProcedure
+    .mutation(async ({ ctx }) => {
+      const userId = ctx.session.user.id;
+
+      // Get the user's wallet
+      const userWallet = await ctx.db.userWallet.findFirst({
+        where: {
+          userId: userId,
+        },
+      });
+
+      if (!userWallet) {
+        throw new Error("User wallet not found. Please create a wallet first.");
+      }
+
+      const swingService = new SwingService(ctx.db);
 
       try {
-        console.log("Received " + channel + " webhook:", JSON.stringify(input, null, 2));
 
-
-        const phoneNumberWithCountryCode = typedInput.waId;
-
-        if (!phoneNumberWithCountryCode) {
-          console.error('Phone number not found');
-          return { status: 'success', message: 'Ops, something went wrong. We were unable to identify your phone number. Please try again later.' };
-        }
-
-        var user = await ctx.db.user.findFirst({
-          where: {
-            phoneNumberWithCountryCode: phoneNumberWithCountryCode
-          }
-        });
-
-        let newUser = false;
-
-        if (!user) {
-          console.log("User not found, creating new user");
-          user = await ctx.db.user.create({
-            data: {
-              phoneNumberWithCountryCode: phoneNumberWithCountryCode
-            }
-          });
-          newUser = true;
-        }
-
-        console.log("User:", user.id + " " + (user.phoneNumberWithCountryCode ?? "No phone number"));
-
-        if (!typedInput.accountSid) {
-          console.log("AccountSid not found, skipping");
-          return { status: 'success', message: 'Ops, something went wrong. We were unable to identify your account. Please try again later.' };
-        }
-
-        var userAccount = await ctx.db.account.findFirst({
-          where: {
-            userId: user.id,
-            provider: provider,
-            providerAccountId: typedInput.accountSid
-          }
-        });
-
-        let newUserAccount = false;
-        if (!userAccount) {
-          console.log("User account not found, creating new user account");
-          userAccount = await ctx.db.account.create({
-            data: {
-              userId: user.id,
-              provider: provider,
-              providerAccountId: typedInput.waId,
-              type: channel
-            }
-          });
-          newUserAccount = true;
-        }
-
-        console.log("User account:", userAccount.id + " " + userAccount.provider + " " + userAccount.providerAccountId);
-
-        currentStep = "recording your chat message";
-
-        await ctx.db.chat.create({
-          data: {
-            accountId: user.id,
-            chatContent: typedInput.body || '',
-            actor: "You",
-            chatExternalId: typedInput.chatExternalId,
-            chatExternalConversationId: typedInput.chatExternalConversationId,
-            chatExternalProviderName: provider,
-            currentPhoneNumberWithCountryCode: phoneNumberWithCountryCode,
-            date: new Date(typedInput.dateCreated || new Date())
-          },
-        });
-
-
-
-        var userWallet = await ctx.db.userWallet.findFirst({
-          where: {
-            userId: user.id,
-          },
-        });
-
-
-        let newUserWallet = false;
-        if (!userWallet) {
-          currentStep = "creating your wallet";
-          const cryptoService = new CryptoService(ctx.db);
-          userWallet = await cryptoService.createCryptoWallet(
-            user.id!,
-            user.name || `user-${user.id}`,
-            'ethereum',
-            'ETH'
-          );
-          newUserWallet = true;
-        }
-
-        currentStep = "getting your earlier chat messages";
-        // Get recent chat history for context
-        const recentMessages = await ctx.db.chat.findMany({
-          where: {
-            accountId: user.id,
-          },
-          take: 100,
-          orderBy: {
-            date: 'desc',
-          },
-          select: {
-            chatContent: true,
-            actor: true,
-          },
-        });
-
-        // Format the context string from recent messages (oldest first)
-        const contextHistory = recentMessages
-          .reverse()
-          .map(msg => `${msg.actor}: ${msg.chatContent}`)
-          .join('\n');
-
-        const agentName = "chatGpt";
-
-
-        // Generate AI response using GptService
-        currentStep = "generating response to your request via AI";
-        const aiResponseContent = await gptService.generateChatResponse(
-          user.id,
-          userWallet!,
-          agentName,
-          typedInput.body,
-          contextHistory
+        const fromAmount = 1.0;
+        const result = await swingService.swapTrade(
+          userWallet.address as `0x${string}`,
+          "base",
+          "usdc",
+          "brett",
+          fromAmount,
+          false,
+          null
         );
 
-        await ctx.db.chat.create({
-          data: {
-            accountId: user.id,
-            chatContent: aiResponseContent,
-            actor: "Agent",
-            currentPhoneNumberWithCountryCode: user?.phoneNumberWithCountryCode,
-            chatExternalConversationId: typedInput.chatExternalConversationId,
-            chatExternalProviderName: provider
-          },
-        });
+        console.log("Result:", JSON.stringify(result, null, 2));
 
-
-        // var messagePrefix = "";
-
-        // const appName = "Peasy";
-
-        // if (newUser) {
-        //   messagePrefix = "Hello " + typedInput.firstName + "! Welcome to " + appName + "! I'm your web3 AI assistant.\r\n";
-        // }
-
-        // if (newUserAccount) {
-        //   messagePrefix += "I realize this is the first time you're using our service on this channel.\r\n";
-        // }
-
-        // if (newUserWallet) {
-        //   messagePrefix += "I just created a wallet for you with address " + userWallet?.address + ".\r\n";
-        // }
-
-        // messagePrefix += "Please let me know how I can help you today.\r\n";
-
-
+        return result;
+      } catch (error: any) {
+        console.error("Error executing test trade:", error);
         return {
-          status: 'success',
-          message: aiResponseContent
-        };
-
-
-
-      } catch (error) {
-        console.error('Error handling Twilio webhook:', error);
-        // Still return success even on errors, but log them
-        return {
-          status: 'success',
-          message: 'Ops, something went wrong while ' + currentStep + '. Please try again later.',
-          error: error instanceof Error ? error : { message: String(error) }
+          isSuccess: false,
+          error: error.message
         };
       }
     }),

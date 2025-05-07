@@ -31,7 +31,7 @@ export function SiteHeader() {
     undefined, 
     { 
       enabled: !!session,
-      refetchInterval: 3000, // Refetch every 3 seconds
+      refetchInterval: 60000, // Refetch every 60 seconds
       refetchOnWindowFocus: true, // Refetch when window regains focus
       select: (data) => data.totalCredits
     }

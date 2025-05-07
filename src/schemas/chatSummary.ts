@@ -11,4 +11,9 @@ export const ChatSummarySchema = z.object({
   rationaleForResponse: z.string(),
 });
 
+export const ChatSummaryChangeTalkingStyleSchema = z.object({
+  chatMessage: z.string().optional(),
+  rationaleForResponse: z.string(),
+});
+
 export type ChatSummary = z.infer<typeof ChatSummarySchema>; 

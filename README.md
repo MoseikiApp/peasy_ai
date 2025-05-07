@@ -39,3 +39,4 @@ Use .env.example to create .env file and set the correct variables on your local
 ##Telegram Bot - Webhook setup
 
 curl -F "url=https://your-domain.com/webhook" -F "secret_token=YOUR_SECRET_TOKEN" https://api.telegram.org/bot<YOUR_BOT_TOKEN>/setWebhook
+

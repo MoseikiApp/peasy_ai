@@ -1,3 +1,5 @@
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-nocheck
 /** @type {import("eslint").Linter.Config} */
 const config = {
   "parser": "@typescript-eslint/parser",
@@ -45,9 +47,15 @@ const config = {
     "@typescript-eslint/no-unsafe-function-type": "off",
     "@typescript-eslint/prefer-nullish-coalescing": "off",
     "@typescript-eslint/no-unnecessary-type-assertion": "off",
+    "@typescript-eslint/no-unused-vars": "off",
     "@typescript-eslint/no-explicit-any": "off",
     "@typescript-eslint/dot-notation": "off",
     "@typescript-eslint/restrict-template-expressions": "off",
+    "@typescript-eslint/prefer-optional-chain": "off",
+    "@typescript-eslint/prefer-for-of": "off",
+    "@typescript-eslint/no-floating-promises": "off",
+    "@typescript-eslint/consistent-type-imports": "off",
+    "@typescript-eslint/no-inferrable-types": "off",
     "no-var": "off",
     "prefer-const": "off",
     "no-console": "off",

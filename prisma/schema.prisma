@@ -70,6 +70,7 @@ model User {
     chats         Chat[]
     financialActions FinancialChatAction[]
     wallet        UserWallet?
+    addressBook   AddressBook[]
 }
 
 model VerificationToken {
@@ -171,6 +172,8 @@ model FinancialChatAction {
   actionOutputWalletBalanceBefore Decimal?  @db.Decimal(20, 8)
   actionOutputWalletBalanceAfter  Decimal?  @db.Decimal(20, 8)
   actionOutputWalletOwnerAccountId String?
+  commissionAmountInEth             Decimal?  @db.Decimal(36, 18)
+  commissionWalletAddress           String?   @db.VarChar(256)
 
   user                            User      @relation(fields: [accountId], references: [id], onDelete: Cascade)
   chats                           Chat[]
@@ -242,4 +245,21 @@ model CryptoErc20Token {
   
   @@index([chainId])
   @@unique([symbol, chainId])  // Maintain unique composite index for symbol+chainId
+}
+
+// Address book model for storing user's wallet addresses
+model AddressBook {
+  id             String   @id @default(uuid())
+  userId         String
+  name           String   @db.VarChar(256)
+  phoneNumberWithCountryCode String?  @db.VarChar(100)
+  walletAddress  String   @db.VarChar(256)
+  telegramHandle String?  @db.VarChar(100)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@index([userId])
+  @@index([walletAddress])
 }
